@@ -1,0 +1,260 @@
+package com.carecircle.communication.service.impl;
+
+import com.carecircle.communication.dto.response.ChatMessageResponse;
+import com.carecircle.communication.dto.response.ChatRoomInitializationResponse;
+import com.carecircle.communication.dto.response.ChatRoomSummaryResponse;
+import com.carecircle.communication.exception.ChatBlockedException;
+import com.carecircle.communication.model.chat.ChatMessage;
+import com.carecircle.communication.service.interfaces.NotificationService;
+import com.carecircle.communication.model.chat.ChatParticipant;
+import com.carecircle.communication.model.chat.ChatRoom;
+import com.carecircle.communication.model.chat.ChatRoomType;
+import com.carecircle.communication.model.chat.MessageType;
+import com.carecircle.communication.repository.chat.ChatMessageRepository;
+import com.carecircle.communication.repository.chat.ChatParticipantRepository;
+import com.carecircle.communication.repository.chat.ChatRoomRepository;
+import com.carecircle.communication.service.interfaces.BlockService;
+import com.carecircle.communication.service.interfaces.ChatService;
+import com.carecircle.communication.service.UserIntegrationService;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.UUID;
+
+@Service
+@Transactional
+public class ChatServiceImpl implements ChatService {
+
+    private final ChatRoomRepository chatRoomRepository;
+    private final ChatParticipantRepository chatParticipantRepository;
+    private final ChatMessageRepository chatMessageRepository;
+    private final NotificationService notificationService;
+    private final BlockService blockService;
+    private final SimpMessagingTemplate messagingTemplate;
+    private final UserIntegrationService userIntegrationService;
+
+    public ChatServiceImpl(
+            ChatRoomRepository chatRoomRepository,
+            ChatParticipantRepository chatParticipantRepository,
+            ChatMessageRepository chatMessageRepository, 
+            NotificationService notificationService, 
+            BlockService blockService,
+            SimpMessagingTemplate messagingTemplate,
+            UserIntegrationService userIntegrationService
+    ) {
+        this.chatRoomRepository = chatRoomRepository;
+        this.chatParticipantRepository = chatParticipantRepository;
+        this.chatMessageRepository = chatMessageRepository;
+        this.notificationService = notificationService;
+        this.blockService = blockService;
+        this.messagingTemplate = messagingTemplate;
+        this.userIntegrationService = userIntegrationService;
+    }
+
+    @Override
+    public ChatRoomInitializationResponse initializeChatRoom(UUID bookingId, UUID initiatorId, UUID partnerId) {
+        // Check if room already exists for this booking
+        return chatRoomRepository.findByBookingId(bookingId)
+                .map(room -> new ChatRoomInitializationResponse(room.getId(), false))
+                .orElseGet(() -> {
+                    // Create new room
+                    ChatRoom room = new ChatRoom();
+                    room.setType(ChatRoomType.DIRECT);
+                    room.setBookingId(bookingId);
+                    ChatRoom savedRoom = chatRoomRepository.save(room);
+
+                    // Auto-add participants
+                    addParticipant(savedRoom.getId(), initiatorId);
+                    addParticipant(savedRoom.getId(), partnerId);
+
+                    return new ChatRoomInitializationResponse(savedRoom.getId(), true);
+                });
+    }
+
+    @Override
+    public void addParticipant(UUID roomId, UUID userId) {
+        ChatParticipant participant = new ChatParticipant();
+        participant.setRoomId(roomId);
+        participant.setUserId(userId);
+
+        chatParticipantRepository.save(participant);
+    }
+
+    @Override
+    public void sendMessage(UUID roomId, UUID senderId, String message) {
+
+        var participants = chatParticipantRepository.findByRoomId(roomId);
+
+        boolean isBlocked = participants.stream()
+                .map(ChatParticipant::getUserId)
+                .anyMatch(userId -> blockService.isBlocked(userId, senderId));
+
+        if (isBlocked) {
+            throw new ChatBlockedException(
+                    "Message cannot be sent. You are blocked by a participant."
+            );
+        }
+
+        ChatMessage chatMessage = new ChatMessage();
+        chatMessage.setRoomId(roomId);
+        chatMessage.setSenderId(senderId);
+        chatMessage.setContent(message);
+        chatMessage.setMessageType(MessageType.TEXT);
+
+        ChatMessage savedMessage = chatMessageRepository.save(chatMessage);
+        
+        // Broadcast to WebSocket subscribers
+        ChatMessageResponse response = mapToResponse(savedMessage);
+        
+        // Enrich single message sender name
+        userIntegrationService.getUsersInfo(List.of(senderId)).values().stream()
+                .findFirst()
+                .ifPresent(u -> response.setSenderName(u.fullName()));
+
+        messagingTemplate.convertAndSend("/topic/chat/" + roomId, response);
+
+        participants.stream()
+                .map(ChatParticipant::getUserId)
+                .filter(userId -> !userId.equals(senderId))
+                .filter(userId -> !blockService.isBlocked(userId, senderId))
+                .forEach(userId ->
+                        notificationService.createNotification(
+                                userId,
+                                "CHAT",
+                                "New message received"
+                        )
+                );
+    }
+
+    @Override
+    public List<ChatMessageResponse> getRoomMessages(UUID roomId, UUID userId) {
+
+        boolean isParticipant = chatParticipantRepository
+                .existsByRoomIdAndUserId(roomId, userId);
+
+        if (!isParticipant) {
+            throw new IllegalStateException("User is not a participant of this chat room");
+        }
+
+        List<ChatMessage> messages = chatMessageRepository.findByRoomIdOrderByCreatedAtAsc(roomId);
+        
+        // Enrich in batch
+        List<UUID> senderIds = messages.stream().map(ChatMessage::getSenderId).distinct().toList();
+        var userMap = userIntegrationService.getUsersInfo(senderIds);
+
+        return messages.stream()
+                .map(m -> {
+                    ChatMessageResponse res = mapToResponse(m);
+                    if (userMap.containsKey(m.getSenderId())) {
+                        res.setSenderName(userMap.get(m.getSenderId()).fullName());
+                    }
+                    return res;
+                })
+                .toList();
+    }
+
+    @Override
+    public Page<ChatMessageResponse> getRoomMessages(UUID roomId, UUID userId, Pageable pageable) {
+        boolean isParticipant = chatParticipantRepository
+                .existsByRoomIdAndUserId(roomId, userId);
+
+        if (!isParticipant) {
+            throw new IllegalStateException("User is not a participant of this chat room");
+        }
+
+        Page<ChatMessage> messagePage = chatMessageRepository.findByRoomIdOrderByCreatedAtDesc(roomId, pageable);
+
+        // Enrich in batch
+        List<UUID> senderIds = messagePage.getContent().stream().map(ChatMessage::getSenderId).distinct().toList();
+        var userMap = userIntegrationService.getUsersInfo(senderIds);
+
+        return messagePage.map(m -> {
+            ChatMessageResponse res = mapToResponse(m);
+            if (userMap.containsKey(m.getSenderId())) {
+                res.setSenderName(userMap.get(m.getSenderId()).fullName());
+            }
+            return res;
+        });
+    }
+
+    @Override
+    public List<ChatRoomSummaryResponse> getMyChatRooms(UUID userId) {
+        List<ChatParticipant> myParticipations = chatParticipantRepository.findByUserId(userId);
+        
+        List<ChatRoomSummaryResponse> summaries = myParticipations.stream().map(p -> {
+            UUID roomId = p.getRoomId();
+            ChatRoomSummaryResponse summary = new ChatRoomSummaryResponse();
+            summary.setRoomId(roomId);
+
+            // Find partner ID
+            List<ChatParticipant> participants = chatParticipantRepository.findByRoomId(roomId);
+            UUID partnerId = participants.stream()
+                    .map(ChatParticipant::getUserId)
+                    .filter(id -> !id.equals(userId))
+                    .findFirst()
+                    .orElse(null);
+            
+            summary.setPartnerId(partnerId);
+
+            // Latest message
+            chatMessageRepository.findFirstByRoomIdOrderByCreatedAtDesc(roomId)
+                    .ifPresent(m -> {
+                        summary.setLastMessage(m.getContent());
+                        summary.setLastMessageTime(m.getCreatedAt());
+                    });
+
+            // Unread count
+            long unread = chatMessageRepository.countByRoomIdAndSenderIdNotAndReadFalse(roomId, userId);
+            summary.setUnreadCount(unread);
+
+            return summary;
+        }).toList();
+
+        // Enrich partner names in batch
+        List<UUID> partnerIds = summaries.stream()
+                .map(ChatRoomSummaryResponse::getPartnerId)
+                .filter(java.util.Objects::nonNull)
+                .distinct()
+                .toList();
+
+        if (!partnerIds.isEmpty()) {
+            var userMap = userIntegrationService.getUsersInfo(partnerIds);
+            summaries.forEach(s -> {
+                if (s.getPartnerId() != null && userMap.containsKey(s.getPartnerId())) {
+                    s.setPartnerName(userMap.get(s.getPartnerId()).fullName());
+                }
+            });
+        }
+
+        return summaries;
+    }
+
+    @Override
+    public void markAsRead(UUID roomId, UUID userId) {
+        List<ChatMessage> unreadMessages = chatMessageRepository.findByRoomIdOrderByCreatedAtAsc(roomId).stream()
+                .filter(m -> !m.getSenderId().equals(userId) && !m.isRead())
+                .toList();
+        
+        unreadMessages.forEach(m -> m.setRead(true));
+        chatMessageRepository.saveAll(unreadMessages);
+    }
+
+    private ChatMessageResponse mapToResponse(ChatMessage message) {
+        ChatMessageResponse response = new ChatMessageResponse();
+        response.setId(message.getId());
+        response.setSenderId(message.getSenderId());
+        response.setContent(message.getContent());
+        response.setMessageType(message.getMessageType().name());
+        response.setCreatedAt(message.getCreatedAt());
+        return response;
+    }
+
+
+
+
+}
